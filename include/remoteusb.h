@@ -73,6 +73,10 @@ typedef struct rusb_session_config {
     uint64_t rx_window_bytes;
     uint32_t rx_window_pdus;
     uint32_t reserved_rx;
+    uint32_t max_reassembly_size;
+    uint32_t max_fragments;
+    uint32_t max_transfer_size;
+    uint32_t reserved_limits;
 } rusb_session_config;
 
 typedef struct rusb_completion {

@@ -48,6 +48,10 @@ pub struct RusbSessionConfig {
     pub rx_window_bytes: u64,
     pub rx_window_pdus: u32,
     pub reserved_rx: u32,
+    pub max_reassembly_size: u32,
+    pub max_fragments: u32,
+    pub max_transfer_size: u32,
+    pub reserved_limits: u32,
 }
 
 #[repr(C)]
@@ -148,6 +152,7 @@ pub unsafe extern "C" fn rusb_session_create(
             || config.reserved_tail != [0; 7]
             || config.reserved_tx != 0
             || config.reserved_rx != 0
+            || config.reserved_limits != 0
         {
             return Err(CoreError::InvalidArgument);
         }
@@ -173,6 +178,9 @@ pub unsafe extern "C" fn rusb_session_create(
             tx_window_pdus: config.tx_window_pdus,
             rx_window_bytes: config.rx_window_bytes,
             rx_window_pdus: config.rx_window_pdus,
+            max_reassembly_size: config.max_reassembly_size as usize,
+            max_fragments: config.max_fragments as usize,
+            max_transfer_size: config.max_transfer_size as usize,
         })?;
         let session = Box::new(RusbSession {
             engine,

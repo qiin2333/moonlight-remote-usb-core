@@ -30,3 +30,7 @@ Outside the core:
 
 The core has no runtime crate dependencies and does not create worker threads.
 
+The C session config carries the authenticated broker's byte/PDU windows and
+its negotiated reassembly, fragment-count, and transfer-size ceilings. An
+integration must pass those lower limits unchanged; the core rejects invalid
+combinations and enforces them before allocating or dispatching USB work.

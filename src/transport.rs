@@ -33,6 +33,9 @@ pub struct TransportConfig {
     pub tx_window_pdus: u32,
     pub rx_window_bytes: u64,
     pub rx_window_pdus: u32,
+    pub max_reassembly_size: usize,
+    pub max_fragments: usize,
+    pub max_transfer_size: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,14 +77,24 @@ pub struct Transport {
     next_internal_pdu_id: u64,
     output_reservations: HashMap<u64, usize>,
     events: VecDeque<TransportEvent>,
+    max_reassembly_size: usize,
+    max_fragments: usize,
 }
 
 impl Transport {
     pub fn new(config: TransportConfig) -> CoreResult<Self> {
-        let executor = Executor::new(
-            config.hello.max_inflight as usize,
-            config.hello.max_pdu as usize - crate::pdu::HEADER_SIZE,
-        )?;
+        let max_pdu = config.hello.max_pdu as usize;
+        if config.max_reassembly_size > max_pdu
+            || config.max_transfer_size == 0
+            || config.max_transfer_size
+                > config
+                    .max_reassembly_size
+                    .saturating_sub(crate::pdu::HEADER_SIZE)
+        {
+            return Err(CoreError::InvalidArgument);
+        }
+        let reassembler = Reassembler::new(config.max_reassembly_size, config.max_fragments)?;
+        let executor = Executor::new(config.hello.max_inflight as usize, config.max_transfer_size)?;
         let broker = BrokerSession::new(
             config.hello.clone(),
             config.tx_window_bytes,
@@ -95,12 +108,14 @@ impl Transport {
             hello: config.hello,
             broker,
             executor,
-            reassembler: Reassembler::default(),
+            reassembler,
             next_rx_sequence: 1,
             next_tx_sequence: 1,
             next_internal_pdu_id: 1_u64 << 63,
             output_reservations: HashMap::new(),
             events: VecDeque::new(),
+            max_reassembly_size: config.max_reassembly_size,
+            max_fragments: config.max_fragments,
         })
     }
 
@@ -263,10 +278,11 @@ impl Transport {
             }
             (_, TransportState::Running, MessageType::UsbIpData) => {
                 let fragment = Fragment::decode(payload, header.flags)?;
-                if fragment.lease_token != self.hello.lease_token
-                    || fragment.total_length > self.broker.negotiated_max_pdu
-                {
+                if fragment.lease_token != self.hello.lease_token {
                     return Err(CoreError::TokenMismatch);
+                }
+                if fragment.total_length > self.broker.negotiated_max_pdu {
+                    return Err(CoreError::LimitExceeded);
                 }
                 if let Some((pdu_id, pdu)) = self.reassembler.push(fragment)? {
                     let pdu_size = pdu.len();
@@ -373,10 +389,16 @@ impl Transport {
     }
 
     fn fragment_and_queue(&mut self, pdu_id: u64, pdu: &[u8]) -> CoreResult<()> {
-        if pdu.is_empty() || pdu.len() > self.broker.negotiated_max_pdu as usize {
+        if pdu.is_empty()
+            || pdu.len() > self.broker.negotiated_max_pdu as usize
+            || pdu.len() > self.max_reassembly_size
+        {
             return Err(CoreError::LimitExceeded);
         }
         let max_chunk = wire::MAX_PAYLOAD - wire::FRAGMENT_PREFIX_SIZE;
+        if pdu.len().div_ceil(max_chunk) > self.max_fragments {
+            return Err(CoreError::LimitExceeded);
+        }
         let mut offset = 0;
         while offset < pdu.len() {
             let end = (offset + max_chunk).min(pdu.len());
@@ -517,6 +539,9 @@ mod tests {
             tx_window_pdus: 0,
             rx_window_bytes: 0,
             rx_window_pdus: 0,
+            max_reassembly_size: 4096,
+            max_fragments: 4,
+            max_transfer_size: 4096 - crate::pdu::HEADER_SIZE,
         })
         .unwrap();
         transport.start().unwrap();
@@ -542,6 +567,9 @@ mod tests {
             tx_window_pdus: 0,
             rx_window_bytes: 0,
             rx_window_pdus: 0,
+            max_reassembly_size: 4096,
+            max_fragments: 4,
+            max_transfer_size: 4096 - crate::pdu::HEADER_SIZE,
         })
         .unwrap();
         transport.start().unwrap();

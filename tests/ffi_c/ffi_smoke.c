@@ -28,6 +28,9 @@ int main(void)
     memset(config.capability_nonce, 6, sizeof(config.capability_nonce));
     config.max_pdu = 4096;
     config.max_inflight = 4;
+    config.max_reassembly_size = 4096;
+    config.max_fragments = 4;
+    config.max_transfer_size = 4096 - 48;
 
     assert(rusb_core_abi_version() == RUSB_CORE_ABI_VERSION);
     assert(rusb_core_protocol_version() == RUSB_CORE_PROTOCOL_VERSION);

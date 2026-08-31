@@ -339,18 +339,51 @@ impl Fragment {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Reassembler {
     active_pdu: Option<u64>,
     lease_token: u64,
     total_length: usize,
     fragments: usize,
     bytes: Vec<u8>,
+    max_reassembly_size: usize,
+    max_fragments: usize,
+}
+
+impl Default for Reassembler {
+    fn default() -> Self {
+        Self {
+            active_pdu: None,
+            lease_token: 0,
+            total_length: 0,
+            fragments: 0,
+            bytes: Vec::new(),
+            max_reassembly_size: MAX_REASSEMBLY,
+            max_fragments: MAX_FRAGMENTS,
+        }
+    }
 }
 
 impl Reassembler {
+    pub fn new(max_reassembly_size: usize, max_fragments: usize) -> CoreResult<Self> {
+        if !(crate::pdu::HEADER_SIZE..=MAX_REASSEMBLY).contains(&max_reassembly_size)
+            || !(1..=MAX_FRAGMENTS).contains(&max_fragments)
+        {
+            return Err(CoreError::InvalidArgument);
+        }
+        Ok(Self {
+            max_reassembly_size,
+            max_fragments,
+            ..Self::default()
+        })
+    }
+
     pub fn push(&mut self, fragment: Fragment) -> CoreResult<Option<(u64, Vec<u8>)>> {
         fragment.validate()?;
+        if fragment.total_length as usize > self.max_reassembly_size {
+            self.clear();
+            return Err(CoreError::LimitExceeded);
+        }
         if let Some(active) = self.active_pdu {
             if active != fragment.pdu_id
                 || self.lease_token != fragment.lease_token
@@ -370,7 +403,7 @@ impl Reassembler {
             self.bytes = Vec::with_capacity(self.total_length);
         }
         self.fragments += 1;
-        if self.fragments > MAX_FRAGMENTS {
+        if self.fragments > self.max_fragments {
             self.clear();
             return Err(CoreError::LimitExceeded);
         }
@@ -390,7 +423,11 @@ impl Reassembler {
     }
 
     pub fn clear(&mut self) {
-        *self = Self::default();
+        self.active_pdu = None;
+        self.lease_token = 0;
+        self.total_length = 0;
+        self.fragments = 0;
+        self.bytes.clear();
     }
 }
 
@@ -616,6 +653,38 @@ mod tests {
             reassembler.push(second).unwrap(),
             Some((11, vec![1, 2, 3, 4, 5]))
         );
+    }
+
+    #[test]
+    fn negotiated_reassembly_limits_are_enforced() {
+        let oversized = Fragment {
+            lease_token: 9,
+            pdu_id: 11,
+            total_length: 49,
+            offset: 0,
+            data: vec![0; 49],
+            more: false,
+        };
+        let mut size_limited = Reassembler::new(48, 2).unwrap();
+        assert_eq!(size_limited.push(oversized), Err(CoreError::LimitExceeded));
+
+        let first = Fragment {
+            lease_token: 9,
+            pdu_id: 12,
+            total_length: 48,
+            offset: 0,
+            data: vec![0],
+            more: true,
+        };
+        let second = Fragment {
+            offset: 1,
+            data: vec![0; 47],
+            more: false,
+            ..first.clone()
+        };
+        let mut fragment_limited = Reassembler::new(48, 1).unwrap();
+        assert!(fragment_limited.push(first).unwrap().is_none());
+        assert_eq!(fragment_limited.push(second), Err(CoreError::LimitExceeded));
     }
 
     #[test]
