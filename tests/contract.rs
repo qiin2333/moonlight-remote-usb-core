@@ -1,7 +1,9 @@
 use moonlight_remote_usb_core::broker::Hello;
 use moonlight_remote_usb_core::pdu::{Direction, Request, SubmitRequest, UnlinkRequest};
 use moonlight_remote_usb_core::usbip::ControlRequest;
-use moonlight_remote_usb_core::wire::{self, Capability, Endpoint, FrameHeader, MessageType, Open};
+use moonlight_remote_usb_core::wire::{
+    self, Capability, Endpoint, Fragment, FrameHeader, MessageType, Open,
+};
 use std::fmt::Write;
 
 const VECTORS: &str = include_str!("../contract/vectors-v1.json");
@@ -118,6 +120,18 @@ fn normative_v1_vectors_match_codecs() {
     .encode()
     .unwrap();
     assert_eq!(hex(&submit), vector("usbip_submit"));
+
+    let fragment = Fragment {
+        lease_token: 9,
+        pdu_id: 11,
+        total_length: u32::try_from(submit.len()).unwrap(),
+        offset: 0,
+        data: submit.clone(),
+        more: false,
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(hex(&fragment), vector("usbip_fragment"));
 
     let unlink = Request::Unlink(UnlinkRequest {
         seqnum: 18,
