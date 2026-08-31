@@ -50,7 +50,9 @@ fn capability() -> Capability {
         device_subclass: 0,
         device_protocol: 0,
         bus_id: b"moonlight-1".to_vec(),
-        raw_descriptors: vec![18, 1, 0, 2],
+        // Keep the fixture a valid descriptor chain so strict importers can
+        // consume the same normative vector without weakening validation.
+        raw_descriptors: vec![2, 1],
         endpoints: vec![Endpoint {
             interface_number: 0,
             alternate_setting: 0,
