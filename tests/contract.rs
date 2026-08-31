@@ -33,7 +33,7 @@ fn hello() -> Hello {
         attachment_token: 7,
         lease_token: 9,
         capability_nonce: [6; 16],
-        max_pdu: 4096,
+        max_pdu: 49,
         max_inflight: 4,
         isochronous: false,
     }
