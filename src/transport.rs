@@ -76,9 +76,16 @@ pub struct Transport {
     next_tx_sequence: u64,
     next_internal_pdu_id: u64,
     output_reservations: HashMap<u64, usize>,
+    pending_replies: VecDeque<PendingReply>,
     events: VecDeque<TransportEvent>,
     max_reassembly_size: usize,
     max_fragments: usize,
+}
+
+#[derive(Debug)]
+struct PendingReply {
+    pdu_id: u64,
+    pdu: Vec<u8>,
 }
 
 impl Transport {
@@ -113,6 +120,7 @@ impl Transport {
             next_tx_sequence: 1,
             next_internal_pdu_id: 1_u64 << 63,
             output_reservations: HashMap::new(),
+            pending_replies: VecDeque::new(),
             events: VecDeque::new(),
             max_reassembly_size: config.max_reassembly_size,
             max_fragments: config.max_fragments,
@@ -126,7 +134,7 @@ impl Transport {
 
     #[must_use]
     pub fn inflight(&self) -> usize {
-        self.executor.inflight() + self.output_reservations.len()
+        self.executor.inflight() + self.output_reservations.len() + self.pending_replies.len()
     }
 
     pub fn start(&mut self) -> CoreResult<()> {
@@ -220,7 +228,8 @@ impl Transport {
             .output_reservations
             .remove(&reservation_id)
             .ok_or(CoreError::NotFound)?;
-        self.broker.ack_send(bytes)
+        self.broker.ack_send(bytes)?;
+        self.drain_pending_replies()
     }
 
     pub fn accept_frame(&mut self, wire_bytes: &[u8]) -> CoreResult<()> {
@@ -336,6 +345,20 @@ impl Transport {
         self.handle_executor_events(events)
     }
 
+    /// Validate completion metadata before an FFI boundary copies its buffer.
+    pub fn validate_completion(
+        &self,
+        request_token: u64,
+        actual_length: u32,
+        data_length: usize,
+    ) -> CoreResult<bool> {
+        if self.state != TransportState::Running {
+            return Err(CoreError::InvalidState);
+        }
+        self.executor
+            .validate_completion(request_token, actual_length, data_length)
+    }
+
     pub fn complete_cancel(&mut self, request_token: u64, status: i32) -> CoreResult<()> {
         if self.state != TransportState::Running {
             return Err(CoreError::InvalidState);
@@ -363,8 +386,23 @@ impl Transport {
                 }),
                 ExecutorEvent::Reply { pdu } => {
                     let pdu_id = self.allocate_internal_pdu_id()?;
-                    self.send_pdu(pdu_id, &pdu)?;
+                    self.pending_replies.push_back(PendingReply { pdu_id, pdu });
                 }
+            }
+        }
+        self.drain_pending_replies()
+    }
+
+    fn drain_pending_replies(&mut self) -> CoreResult<()> {
+        while let Some(reply) = self.pending_replies.front() {
+            let pdu_id = reply.pdu_id;
+            let pdu = reply.pdu.clone();
+            match self.send_pdu(pdu_id, &pdu) {
+                Ok(()) => {
+                    self.pending_replies.pop_front();
+                }
+                Err(CoreError::WindowExhausted) => break,
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -373,6 +411,10 @@ impl Transport {
     pub fn close(&mut self) -> CoreResult<()> {
         if matches!(self.state, TransportState::Closed | TransportState::Failed) {
             return Ok(());
+        }
+        if self.state == TransportState::Running {
+            let events = self.executor.close()?;
+            self.handle_executor_events(events)?;
         }
         self.state = TransportState::Closing;
         let payload = self.hello.lease_token.to_le_bytes();
@@ -557,14 +599,14 @@ mod tests {
         ));
     }
 
-    fn running_exporter() -> Transport {
+    fn running_exporter_with_windows(tx_window_bytes: u64, tx_window_pdus: u32) -> Transport {
         let hello = hello();
         let hello_wire = hello.encode().unwrap();
         let mut transport = Transport::new(TransportConfig {
             role: Role::Exporter,
             hello,
-            tx_window_bytes: 0,
-            tx_window_pdus: 0,
+            tx_window_bytes,
+            tx_window_pdus,
             rx_window_bytes: 0,
             rx_window_pdus: 0,
             max_reassembly_size: 4096,
@@ -603,6 +645,10 @@ mod tests {
         transport.next_event();
         assert_eq!(transport.next_event(), Some(TransportEvent::Opened));
         transport
+    }
+
+    fn running_exporter() -> Transport {
+        running_exporter_with_windows(0, 0)
     }
 
     #[test]
@@ -703,5 +749,100 @@ mod tests {
         );
         transport.ack_output(reservation_id).unwrap();
         assert_eq!(transport.inflight(), 0);
+    }
+
+    #[test]
+    fn executor_replies_survive_output_backpressure() {
+        let mut transport = running_exporter_with_windows(48, 1);
+        let submit_reply = crate::pdu::Reply::Submit(crate::pdu::SubmitReply {
+            seqnum: 17,
+            direction: Direction::In,
+            status: 0,
+            actual_length: 0,
+            start_frame: 0,
+            error_count: 0,
+            data: Vec::new(),
+        })
+        .encode()
+        .unwrap();
+        let unlink_reply = crate::pdu::Reply::Unlink(crate::pdu::UnlinkReply {
+            seqnum: 18,
+            status: 0,
+        })
+        .encode()
+        .unwrap();
+
+        transport
+            .handle_executor_events(vec![
+                ExecutorEvent::Reply { pdu: submit_reply },
+                ExecutorEvent::Reply { pdu: unlink_reply },
+            ])
+            .unwrap();
+        let Some(TransportEvent::OutputFrame { reservation_id, .. }) = transport.next_event()
+        else {
+            panic!("expected first reply");
+        };
+        assert_eq!(transport.pending_replies.len(), 1);
+        transport.ack_output(reservation_id).unwrap();
+        assert!(matches!(
+            transport.next_event(),
+            Some(TransportEvent::OutputFrame { reservation_id, .. }) if reservation_id != 0
+        ));
+        assert!(transport.pending_replies.is_empty());
+    }
+
+    #[test]
+    fn close_emits_cancellation_before_close_frame() {
+        let mut transport = running_exporter();
+        let submit = Request::Submit(SubmitRequest {
+            seqnum: 21,
+            device_id: 1,
+            direction: Direction::In,
+            endpoint: 1,
+            transfer_flags: 0,
+            transfer_buffer_length: 0,
+            start_frame: 0,
+            interval: 0,
+            setup: [0; 8],
+            data: Vec::new(),
+        })
+        .encode()
+        .unwrap();
+        let fragment = Fragment {
+            lease_token: 9,
+            pdu_id: 12,
+            total_length: u32::try_from(submit.len()).unwrap(),
+            offset: 0,
+            data: submit,
+            more: false,
+        };
+        let frame = wire::encode_frame(
+            FrameHeader {
+                message_type: MessageType::UsbIpData,
+                flags: 0,
+                payload_length: u32::try_from(fragment.encode().unwrap().len()).unwrap(),
+                session_token: 3,
+                sequence: 2,
+            },
+            &fragment.encode().unwrap(),
+        )
+        .unwrap();
+        transport.accept_frame(&frame).unwrap();
+        let Some(TransportEvent::Submit { .. }) = transport.next_event() else {
+            panic!("expected pending submit");
+        };
+        transport.close().unwrap();
+        let Some(TransportEvent::OutputFrame { bytes, .. }) = transport.next_event() else {
+            panic!("expected cancellation frame");
+        };
+        let (_, payload) = wire::decode_frame(&bytes).unwrap();
+        assert_eq!(payload.len(), crate::wire::FRAGMENT_PREFIX_SIZE + 48);
+        let Some(TransportEvent::OutputFrame { bytes, .. }) = transport.next_event() else {
+            panic!("expected close frame");
+        };
+        assert_eq!(
+            wire::decode_frame(&bytes).unwrap().0.message_type,
+            MessageType::Close
+        );
     }
 }

@@ -450,9 +450,7 @@ pub fn decode_frame(wire: &[u8]) -> CoreResult<(FrameHeader, &[u8])> {
     if wire.len() != HEADER_SIZE + header.payload_length as usize {
         return Err(CoreError::Malformed);
     }
-    let payload = &wire[HEADER_SIZE..];
-    validate_payload(header.message_type, header.flags, payload)?;
-    Ok((header, payload))
+    Ok((header, &wire[HEADER_SIZE..]))
 }
 
 pub fn validate_payload(kind: MessageType, flags: u32, payload: &[u8]) -> CoreResult<()> {

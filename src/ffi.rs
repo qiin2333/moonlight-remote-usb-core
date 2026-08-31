@@ -303,6 +303,13 @@ pub unsafe extern "C" fn rusb_session_complete(
             completion.version,
             size_of_u32::<RusbCompletion>(),
         )?;
+        if !session.engine.validate_completion(
+            request_token,
+            completion.actual_length,
+            completion.data_length,
+        )? {
+            return Ok(());
+        }
         let data = borrowed_bytes(completion.data, completion.data_length)?;
         session.engine.complete(
             request_token,

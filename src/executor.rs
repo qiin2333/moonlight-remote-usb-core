@@ -71,6 +71,37 @@ impl Executor {
         self.pending_by_sequence.len()
     }
 
+    /// Validate completion metadata without consuming the pending request.
+    /// Returns `false` when the token was already retired and the completion
+    /// should be ignored without copying caller-owned data.
+    pub fn validate_completion(
+        &self,
+        request_token: u64,
+        actual_length: u32,
+        data_length: usize,
+    ) -> CoreResult<bool> {
+        let Some(sequence) = self.sequence_by_token.get(&request_token) else {
+            if self.retired_tokens.contains(&request_token) {
+                return Ok(false);
+            }
+            return Err(CoreError::NotFound);
+        };
+        let pending = self
+            .pending_by_sequence
+            .get(sequence)
+            .ok_or(CoreError::Internal)?;
+        let expected_data_length = match pending.request.direction {
+            crate::pdu::Direction::In => actual_length as usize,
+            crate::pdu::Direction::Out => 0,
+        };
+        if data_length != expected_data_length
+            || actual_length > pending.request.transfer_buffer_length
+        {
+            return Err(CoreError::Malformed);
+        }
+        Ok(true)
+    }
+
     pub fn accept_pdu(&mut self, wire: &[u8]) -> CoreResult<Vec<ExecutorEvent>> {
         match Request::decode(wire)? {
             Request::Submit(request) => self.accept_submit(request),
@@ -133,7 +164,7 @@ impl Executor {
         request_token: u64,
         completion: Completion,
     ) -> CoreResult<Vec<ExecutorEvent>> {
-        let Some(sequence) = self.sequence_by_token.remove(&request_token) else {
+        let Some(&sequence) = self.sequence_by_token.get(&request_token) else {
             if self.retired_tokens.contains(&request_token) {
                 return Ok(Vec::new());
             }
@@ -141,9 +172,8 @@ impl Executor {
         };
         let pending = self
             .pending_by_sequence
-            .remove(&sequence)
+            .get(&sequence)
             .ok_or(CoreError::Internal)?;
-        self.remember_retired(request_token);
         let expected_data_length = match pending.request.direction {
             crate::pdu::Direction::In => completion.actual_length as usize,
             crate::pdu::Direction::Out => 0,
@@ -153,10 +183,12 @@ impl Executor {
         {
             return Err(CoreError::Malformed);
         }
+        let request = pending.request.clone();
+        let unlink_seqnum = pending.unlink_seqnum;
         let mut events = vec![ExecutorEvent::Reply {
             pdu: Reply::Submit(SubmitReply {
-                seqnum: pending.request.seqnum,
-                direction: pending.request.direction,
+                seqnum: request.seqnum,
+                direction: request.direction,
                 status: completion.status,
                 actual_length: completion.actual_length,
                 start_frame: completion.start_frame,
@@ -165,7 +197,7 @@ impl Executor {
             })
             .encode()?,
         }];
-        if let Some(unlink_seqnum) = pending.unlink_seqnum {
+        if let Some(unlink_seqnum) = unlink_seqnum {
             events.push(ExecutorEvent::Reply {
                 pdu: Reply::Unlink(UnlinkReply {
                     seqnum: unlink_seqnum,
@@ -174,6 +206,9 @@ impl Executor {
                 .encode()?,
             });
         }
+        self.sequence_by_token.remove(&request_token);
+        self.pending_by_sequence.remove(&sequence);
+        self.remember_retired(request_token);
         Ok(events)
     }
 
@@ -182,7 +217,7 @@ impl Executor {
         request_token: u64,
         unlink_status: i32,
     ) -> CoreResult<Vec<ExecutorEvent>> {
-        let Some(sequence) = self.sequence_by_token.remove(&request_token) else {
+        let Some(&sequence) = self.sequence_by_token.get(&request_token) else {
             if self.retired_tokens.contains(&request_token) {
                 return Ok(Vec::new());
             }
@@ -190,15 +225,18 @@ impl Executor {
         };
         let pending = self
             .pending_by_sequence
-            .remove(&sequence)
+            .get(&sequence)
             .ok_or(CoreError::Internal)?;
         let unlink_seqnum = pending.unlink_seqnum.ok_or(CoreError::InvalidState)?;
+        let request = pending.request.clone();
+        self.sequence_by_token.remove(&request_token);
+        self.pending_by_sequence.remove(&sequence);
         self.remember_retired(request_token);
         Ok(vec![
             ExecutorEvent::Reply {
                 pdu: Reply::Submit(SubmitReply {
-                    seqnum: pending.request.seqnum,
-                    direction: pending.request.direction,
+                    seqnum: request.seqnum,
+                    direction: request.direction,
                     status: USB_STATUS_CANCELLED,
                     actual_length: 0,
                     start_frame: 0,
@@ -364,5 +402,64 @@ mod tests {
         assert_eq!(decoded.direction, Direction::Out);
         assert_eq!(decoded.actual_length, 4);
         assert!(decoded.data.is_empty());
+    }
+
+    #[test]
+    fn malformed_completion_preserves_pending_request() {
+        let mut executor = Executor::new(4, 1024).unwrap();
+        let event = executor
+            .accept_pdu(&Request::Submit(submit(11)).encode().unwrap())
+            .unwrap()
+            .remove(0);
+        let ExecutorEvent::Submit { request_token, .. } = event else {
+            panic!("expected submit event");
+        };
+        assert_eq!(
+            executor.complete(
+                request_token,
+                Completion {
+                    status: 0,
+                    actual_length: 2,
+                    start_frame: 0,
+                    error_count: 0,
+                    data: vec![1],
+                },
+            ),
+            Err(CoreError::Malformed)
+        );
+        assert_eq!(executor.inflight(), 1);
+        assert_eq!(
+            executor
+                .complete(
+                    request_token,
+                    Completion {
+                        status: 0,
+                        actual_length: 0,
+                        start_frame: 0,
+                        error_count: 0,
+                        data: Vec::new(),
+                    },
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn cancel_without_unlink_preserves_pending_request() {
+        let mut executor = Executor::new(4, 1024).unwrap();
+        let event = executor
+            .accept_pdu(&Request::Submit(submit(12)).encode().unwrap())
+            .unwrap()
+            .remove(0);
+        let ExecutorEvent::Submit { request_token, .. } = event else {
+            panic!("expected submit event");
+        };
+        assert_eq!(
+            executor.complete_cancel(request_token, 0),
+            Err(CoreError::InvalidState)
+        );
+        assert_eq!(executor.inflight(), 1);
     }
 }

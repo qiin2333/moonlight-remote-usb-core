@@ -357,7 +357,6 @@ pub enum ServerState {
 pub struct ServerSession {
     expected_bus_id: String,
     state: ServerState,
-    device_list_seen: bool,
 }
 
 impl ServerSession {
@@ -366,7 +365,6 @@ impl ServerSession {
         Ok(Self {
             expected_bus_id,
             state: ServerState::New,
-            device_list_seen: false,
         })
     }
 
@@ -407,7 +405,6 @@ impl ServerSession {
         {
             return Err(CoreError::InvalidState);
         }
-        self.device_list_seen = status == 0 && device_count != 0;
         self.state = ServerState::Ready;
         Ok(())
     }
