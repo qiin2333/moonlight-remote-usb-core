@@ -1,0 +1,27 @@
+[package]
+name = "moonlight-remote-usb-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+description = "Platform-neutral Remote USB protocol core for Moonlight and Sunshine"
+repository = "https://github.com/qiin2333/moonlight-remote-usb-core"
+
+[lib]
+name = "moonlight_remote_usb_core"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[features]
+default = ["std"]
+std = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
